@@ -3,31 +3,25 @@
 import { useState, useEffect } from "react";
 import { createClient } from "@supabase/supabase-js";
 
-// ตั้งค่า Supabase Client
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
-// ตั้งค่า Telegram Config จาก Environment Variables
 const TELEGRAM_BOT_TOKEN = process.env.NEXT_PUBLIC_TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.NEXT_PUBLIC_TELEGRAM_CHAT_ID;
 
 export default function SellPage() {
   const [products, setProducts] = useState([]);
-  const [selectedProductId, setSelectedProductId] = useState("");
-  const [quantity, setQuantity] = useState(1);
+  const [cart, setCart] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [search, setSearch] = useState("");
 
-  // ดึงข้อมูลสินค้าจาก Supabase
   const fetchProducts = async () => {
-    const { data, error } = await supabase.from("products").select("*");
+    const { data, error } = await supabase.from("products").select("*").order("id", { ascending: true });
     if (error) {
       console.error("Error fetching products:", error);
     } else {
       setProducts(data || []);
-      if (data && data.length > 0 && !selectedProductId) {
-        setSelectedProductId(data[0].id);
-      }
     }
   };
 
@@ -35,170 +29,258 @@ export default function SellPage() {
     fetchProducts();
   }, []);
 
-  const selectedProduct = products.find(
-    (p) => String(p.id) === String(selectedProductId)
-  );
-
-  // ฟังก์ชันยิงแจ้งเตือนไปยัง Telegram API
   const sendTelegramNotification = async (messageText) => {
-    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-      console.warn("Telegram Token หรือ Chat ID ยังไม่ได้ตั้งค่าใน .env");
-      return;
-    }
-
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     try {
-      const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-      const response = await fetch(url, {
+      await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: TELEGRAM_CHAT_ID,
           text: messageText,
           parse_mode: "HTML",
         }),
       });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        console.error("Telegram API Error:", errorData);
-      }
     } catch (err) {
-      // ครอบ try-catch เพื่อป้องกันไม่ให้กระทบกระบวนการขายบนหน้าเว็บ
-      console.error("Failed to send Telegram notification:", err);
+      console.error("Telegram notification failed:", err);
     }
   };
 
-  // ฟังก์ชันบันทึกการขายและตัดสต๊อก
-  const handleSell = async (e) => {
-    e.preventDefault();
-    if (!selectedProduct) return alert("กรุณาเลือกสินค้า");
+  const addToCart = (product) => {
+    if (product.stock <= 0) return alert("สินค้าหมด!");
 
-    const sellQty = parseInt(quantity);
-    if (isNaN(sellQty) || sellQty <= 0) return alert("กรุณาระบุจำนวนที่ถูกต้อง");
-    if (sellQty > selectedProduct.stock) return alert("สินค้าในสต๊อกมีไม่พอ");
+    setCart((prevCart) => {
+      const existing = prevCart.find((item) => item.id === product.id);
+      if (existing) {
+        if (existing.quantity >= product.stock) {
+          alert(`สินค้าในสต๊อกมีเพียง ${product.stock} ชิ้น`);
+          return prevCart;
+        }
+        return prevCart.map((item) =>
+          item.id === product.id ? { ...item, quantity: item.quantity + 1 } : item
+        );
+      }
+      return [...prevCart, { ...product, quantity: 1 }];
+    });
+  };
+
+  const updateQuantity = (id, delta) => {
+    setCart((prevCart) =>
+      prevCart
+        .map((item) => {
+          if (item.id === id) {
+            const newQty = item.quantity + delta;
+            if (newQty > item.stock) {
+              alert(`สินค้าในสต๊อกมีเพียง ${item.stock} ชิ้น`);
+              return item;
+            }
+            return newQty > 0 ? { ...item, quantity: newQty } : null;
+          }
+          return item;
+        })
+        .filter(Boolean)
+    );
+  };
+
+  const removeFromCart = (id) => {
+    setCart((prevCart) => prevCart.filter((item) => item.id !== id));
+  };
+
+  const totalAmount = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
+
+  const handleCheckout = async () => {
+    if (cart.length === 0) return alert("กรุณาเลือกสินค้าลงตะกร้าก่อนทำรายการ");
 
     setLoading(true);
-
     try {
-      const newStock = selectedProduct.stock - sellQty;
-      const totalPrice = selectedProduct.price * sellQty;
+      for (const item of cart) {
+        const newStock = item.stock - item.quantity;
+        const itemTotalPrice = item.price * item.quantity;
 
-      // 1. อัปเดตสต๊อกสินค้าในตาราง products
-      const { error: updateError } = await supabase
-        .from("products")
-        .update({ stock: newStock })
-        .eq("id", selectedProduct.id);
+        // 1. ตัดสต๊อก
+        const { error: updateError } = await supabase
+          .from("products")
+          .update({ stock: newStock })
+          .eq("id", item.id);
 
-      if (updateError) throw updateError;
+        if (updateError) throw updateError;
 
-      // 2. บันทึกประวัติลงตาราง sales
-      const { error: salesError } = await supabase.from("sales").insert([
-        {
-          product_id: selectedProduct.id,
-          product_name: selectedProduct.name,
-          quantity: sellQty,
-          total_price: totalPrice,
-          sold_at: new Date().toISOString(),
-        },
-      ]);
+        // 2. บันทึกประวัติการขาย
+        const { error: salesError } = await supabase.from("sales").insert([
+          {
+            product_id: item.id,
+            product_name: item.name,
+            quantity: item.quantity,
+            total_price: itemTotalPrice,
+            sold_at: new Date().toISOString(),
+          },
+        ]);
 
-      if (salesError) throw salesError;
+        if (salesError) throw salesError;
 
-      // --- ระบบส่งแจ้งเตือน Telegram ---
-      const nowFormatted = new Date().toLocaleString("th-TH", {
-        timeZone: "Asia/Bangkok",
-      });
-
-      // งานที่ 1: แจ้งเตือน Order เข้า (New Order Alert)
-      const orderMessage = `🛍️ <b>มีรายการขายใหม่!</b>
-- สินค้า: ${selectedProduct.name}
-- จำนวน: ${sellQty} ชิ้น
-- ราคารวม: ${totalPrice.toLocaleString()} บาท
+        // 3. ยิง Telegram Notification
+        const nowFormatted = new Date().toLocaleString("th-TH", { timeZone: "Asia/Bangkok" });
+        const orderMessage = `🛍️ <b>มีรายการขายใหม่!</b>
+- สินค้า: ${item.name}
+- จำนวน: ${item.quantity} ชิ้น
+- ราคารวม: ${itemTotalPrice.toLocaleString()} บาท
 - สต๊อกคงเหลือปัจจุบัน: ${newStock} ชิ้น
 - เวลา: ${nowFormatted}`;
 
-      await sendTelegramNotification(orderMessage);
+        await sendTelegramNotification(orderMessage);
 
-      // งานที่ 2: แจ้งเตือน Stock เหลือน้อย (Low Stock Alert <= 5)
-      if (newStock <= 5) {
-        const lowStockMessage = `🚨 <b>[เตือนภัย] สต๊อกสินค้าใกล้หมด!</b>
-- สินค้า: ${selectedProduct.name}
+        if (newStock <= 5) {
+          const lowStockMessage = `🚨 <b>[เตือนภัย] สต๊อกสินค้าใกล้หมด!</b>
+- สินค้า: ${item.name}
 - คงเหลือเพียง: ${newStock} ชิ้น
 ⚠️ กรุณาเติมสต๊อกสินค้าด่วน!`;
-
-        await sendTelegramNotification(lowStockMessage);
+          await sendTelegramNotification(lowStockMessage);
+        }
       }
 
-      alert("บันทึกการขายเรียบร้อยแล้ว!");
-      setQuantity(1);
-      fetchProducts(); // โหลดสต๊อกล่าสุดใหม่
+      alert("ชำระเงินและตัดสต๊อกสำเร็จ!");
+      setCart([]);
+      fetchProducts();
     } catch (error) {
-      alert("เกิดข้อผิดพลาดในการขาย: " + error.message);
+      alert("เกิดข้อผิดพลาดในการชำระเงิน: " + error.message);
     } finally {
       setLoading(false);
     }
   };
 
+  const filteredProducts = products.filter((p) =>
+    p.name.toLowerCase().includes(search.toLowerCase()) ||
+    (p.sku && p.sku.toLowerCase().includes(search.toLowerCase()))
+  );
+
   return (
-    <div className="max-w-xl mx-auto p-6 bg-white rounded-lg shadow-md mt-8">
-      <h1 className="text-2xl font-bold mb-6 text-gray-800">🛒 หน้าร้านขายสินค้า</h1>
-
-      <form onSubmit={handleSell} className="space-y-4">
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">
-            เลือกสินค้า:
-          </label>
-          <select
-            value={selectedProductId}
-            onChange={(e) => setSelectedProductId(e.target.value)}
-            className="w-full p-2 border rounded-md"
-          >
-            {products.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name} — {item.price} บาท (คงเหลือ: {item.stock} ชิ้น)
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">
-            จำนวนที่ขาย:
-          </label>
-          <input
-            type="number"
-            min="1"
-            max={selectedProduct ? selectedProduct.stock : 1}
-            value={quantity}
-            onChange={(e) => setQuantity(e.target.value)}
-            className="w-full p-2 border rounded-md"
-          />
-        </div>
-
-        {selectedProduct && (
-          <div className="p-4 bg-gray-50 rounded-md space-y-1">
-            <p className="text-sm text-gray-600">
-              ราคาต่อหน่วย: <b>{selectedProduct.price}</b> บาท
-            </p>
-            <p className="text-sm text-gray-600">
-              จำนวนคงเหลือ: <b>{selectedProduct.stock}</b> ชิ้น
-            </p>
-            <p className="text-lg font-bold text-green-700 mt-2">
-              ราคารวมทั้งหมด: {(selectedProduct.price * (parseInt(quantity) || 0)).toLocaleString()} บาท
-            </p>
+    <div className="min-h-screen bg-stone-100 p-4 md:p-8 text-stone-800">
+      <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-8">
+        
+        {/* ฝั่งซ้าย: แสดงการ์ดรายการสินค้า */}
+        <div className="lg:col-span-2 space-y-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-4 rounded-xl shadow-sm border border-stone-200">
+            <h1 className="text-2xl font-bold text-emerald-900 flex items-center gap-2">
+              🌿 รายการสินค้า (Fern & Jar)
+            </h1>
+            <input
+              type="text"
+              placeholder="🔍 ค้นหาสินค้า หรือ SKU..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="px-4 py-2 border rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-600 text-sm"
+            />
           </div>
-        )}
 
-        <button
-          type="submit"
-          disabled={loading || !selectedProduct || selectedProduct.stock <= 0}
-          className="w-full bg-green-700 hover:bg-green-800 text-white font-bold py-2 px-4 rounded-md disabled:bg-gray-400"
-        >
-          {loading ? "กำลังบันทึก..." : "ยืนยันการขาย"}
-        </button>
-      </form>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+            {filteredProducts.map((product) => {
+              const isOutOfStock = product.stock <= 0;
+              return (
+                <div
+                  key={product.id}
+                  onClick={() => !isOutOfStock && addToCart(product)}
+                  className={`bg-white p-4 rounded-xl border border-stone-200 shadow-sm transition-all flex flex-col justify-between cursor-pointer hover:shadow-md hover:border-emerald-500 ${
+                    isOutOfStock ? "opacity-50 cursor-not-allowed bg-stone-50" : ""
+                  }`}
+                >
+                  <div>
+                    <div className="text-xs font-semibold text-emerald-700 bg-emerald-50 inline-block px-2 py-0.5 rounded mb-2">
+                      {product.sku || `ID: ${product.id}`}
+                    </div>
+                    <h3 className="font-bold text-stone-900 text-sm md:text-base line-clamp-2">
+                      {product.name}
+                    </h3>
+                  </div>
+
+                  <div className="mt-4 pt-3 border-t border-stone-100 flex items-center justify-between">
+                    <div>
+                      <span className="text-xs text-stone-500 block">คงเหลือ: {product.stock} {product.unit || 'ชิ้น'}</span>
+                      <span className="text-base font-bold text-emerald-800">฿{product.price}</span>
+                    </div>
+                    <button
+                      disabled={isOutOfStock}
+                      className={`p-2 rounded-lg text-white font-bold text-sm ${
+                        isOutOfStock ? "bg-stone-300" : "bg-emerald-700 hover:bg-emerald-800"
+                      }`}
+                    >
+                      {isOutOfStock ? "หมด" : "+ เพิ่ม"}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* ฝั่งขวา: ตะกร้าสินค้าและการชำระเงิน */}
+        <div className="bg-white p-6 rounded-xl shadow-sm border border-stone-200 flex flex-col h-fit sticky top-6">
+          <h2 className="text-xl font-bold text-stone-900 pb-4 border-b border-stone-100 flex items-center justify-between">
+            <span>🛒 ตะกร้าสินค้า</span>
+            <span className="text-xs font-normal text-stone-500">({cart.length} รายการ)</span>
+          </h2>
+
+          <div className="divide-y divide-stone-100 my-4 max-h-[50vh] overflow-y-auto pr-1">
+            {cart.length === 0 ? (
+              <div className="py-12 text-center text-stone-400">
+                <p className="text-3xl mb-2">🍃</p>
+                <p className="text-sm">ยังไม่มีสินค้าในตะกร้า</p>
+                <p className="text-xs text-stone-300 mt-1">กดเลือกสินค้าจากการ์ดซ้ายมือได้เลย</p>
+              </div>
+            ) : (
+              cart.map((item) => (
+                <div key={item.id} className="py-3 flex items-center justify-between gap-2">
+                  <div className="flex-1">
+                    <h4 className="font-semibold text-sm text-stone-800">{item.name}</h4>
+                    <span className="text-xs text-stone-500">฿{item.price} / ชิ้น</span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => updateQuantity(item.id, -1)}
+                      className="w-6 h-6 rounded bg-stone-100 text-stone-700 hover:bg-stone-200 font-bold flex items-center justify-center text-xs"
+                    >
+                      -
+                    </button>
+                    <span className="text-sm font-semibold w-5 text-center">{item.quantity}</span>
+                    <button
+                      onClick={() => updateQuantity(item.id, 1)}
+                      className="w-6 h-6 rounded bg-stone-100 text-stone-700 hover:bg-stone-200 font-bold flex items-center justify-center text-xs"
+                    >
+                      +
+                    </button>
+                    <button
+                      onClick={() => removeFromCart(item.id)}
+                      className="text-red-400 hover:text-red-600 text-xs ml-1"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          <div className="pt-4 border-t border-stone-100 space-y-3">
+            <div className="flex justify-between text-stone-600 text-sm">
+              <span>ยอดรวมทั้งหมด</span>
+              <span className="font-semibold">฿{totalAmount.toLocaleString()}</span>
+            </div>
+            <div className="flex justify-between text-emerald-900 text-xl font-bold pt-2 border-t border-stone-100">
+              <span>ราคาสุทธิ</span>
+              <span>฿{totalAmount.toLocaleString()}</span>
+            </div>
+
+            <button
+              onClick={handleCheckout}
+              disabled={loading || cart.length === 0}
+              className="w-full mt-4 bg-emerald-800 hover:bg-emerald-900 text-white font-bold py-3 px-4 rounded-xl shadow-md disabled:bg-stone-300 disabled:shadow-none transition-all text-center"
+            >
+              {loading ? "กำลังบันทึก..." : "ยืนยันการชำระเงิน"}
+            </button>
+          </div>
+        </div>
+
+      </div>
     </div>
   );
 }
