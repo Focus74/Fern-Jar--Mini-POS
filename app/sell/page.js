@@ -1,230 +1,204 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { supabase } from "../../lib/supabaseClient";
+import { createClient } from "@supabase/supabase-js";
+
+// ตั้งค่า Supabase Client
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+// ตั้งค่า Telegram Config จาก Environment Variables
+const TELEGRAM_BOT_TOKEN = process.env.NEXT_PUBLIC_TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.NEXT_PUBLIC_TELEGRAM_CHAT_ID;
 
 export default function SellPage() {
   const [products, setProducts] = useState([]);
   const [selectedProductId, setSelectedProductId] = useState("");
   const [quantity, setQuantity] = useState(1);
-  const [loading, setLoading] = useState(true);
-  const [submitting, setSubmitting] = useState(false);
+  const [loading, setLoading] = useState(false);
 
-  // ดึงรายการสินค้าทั้งหมดเพื่อนำมาแสดงใน Dropdown
+  // ดึงข้อมูลสินค้าจาก Supabase
   const fetchProducts = async () => {
-    setLoading(true);
-    const { data, error } = await supabase
-      .from("products")
-      .select("*")
-      .order("name", { ascending: true });
-
+    const { data, error } = await supabase.from("products").select("*");
     if (error) {
-      alert("เกิดข้อผิดพลาดในการดึงข้อมูลสินค้า: " + error.message);
+      console.error("Error fetching products:", error);
     } else {
       setProducts(data || []);
-      if (data && data.length > 0) {
-        setSelectedProductId(data[0].id); // เลือกสินค้าตัวแรกเป็นค่าเริ่มต้น
+      if (data && data.length > 0 && !selectedProductId) {
+        setSelectedProductId(data[0].id);
       }
     }
-    setLoading(false);
   };
 
   useEffect(() => {
     fetchProducts();
   }, []);
 
-  // ค้นหาสินค้าที่ถูกเลือกในปัจจุบัน
-  const selectedProduct = products.find((p) => p.id === selectedProductId);
+  const selectedProduct = products.find(
+    (p) => String(p.id) === String(selectedProductId)
+  );
 
-  // คำนวณราคารวมอัตโนมัติ (ราคา x จำนวน)
-  const totalPrice = selectedProduct ? selectedProduct.price * quantity : 0;
-
-  // จัดการการบันทึกการขาย
-  const handleSell = async (e) => {
-    e.preventDefault();
-
-    if (!selectedProduct) {
-      alert("กรุณาเลือกสินค้า");
+  // ฟังก์ชันยิงแจ้งเตือนไปยัง Telegram API
+  const sendTelegramNotification = async (messageText) => {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+      console.warn("Telegram Token หรือ Chat ID ยังไม่ได้ตั้งค่าใน .env");
       return;
     }
-
-    const qty = parseInt(quantity);
-    if (isNaN(qty) || qty <= 0) {
-      alert("กรุณากรอกจำนวนที่ถูกต้อง (มากกว่า 0)");
-      return;
-    }
-
-    // 1. ตรวจสอบว่าสินค้ามีสต็อกเพียงพอหรือไม่
-    if (selectedProduct.stock < qty) {
-      alert(
-        `สินค้าในสต็อกไม่พอ! (คงเหลือ: ${selectedProduct.stock} ${selectedProduct.unit || "ชิ้น"})`
-      );
-      return;
-    }
-
-    setSubmitting(true);
 
     try {
-      // 2. บันทึกรายการลงตาราง sales
-      const saleData = {
-        product_id: selectedProduct.id,
-        product_name: selectedProduct.name,
-        quantity: qty,
-        total_price: totalPrice,
-        sold_at: new Date().toISOString(),
-      };
+      const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID,
+          text: messageText,
+          parse_mode: "HTML",
+        }),
+      });
 
-      const { error: saleError } = await supabase
-        .from("sales")
-        .insert([saleData]);
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error("Telegram API Error:", errorData);
+      }
+    } catch (err) {
+      // ครอบ try-catch เพื่อป้องกันไม่ให้กระทบกระบวนการขายบนหน้าเว็บ
+      console.error("Failed to send Telegram notification:", err);
+    }
+  };
 
-      if (saleError) throw saleError;
+  // ฟังก์ชันบันทึกการขายและตัดสต๊อก
+  const handleSell = async (e) => {
+    e.preventDefault();
+    if (!selectedProduct) return alert("กรุณาเลือกสินค้า");
 
-      // 3. อัปเดต stock ในตาราง products ให้ลดลงตามจำนวนที่ขาย
-      const updatedStock = selectedProduct.stock - qty;
+    const sellQty = parseInt(quantity);
+    if (isNaN(sellQty) || sellQty <= 0) return alert("กรุณาระบุจำนวนที่ถูกต้อง");
+    if (sellQty > selectedProduct.stock) return alert("สินค้าในสต๊อกมีไม่พอ");
+
+    setLoading(true);
+
+    try {
+      const newStock = selectedProduct.stock - sellQty;
+      const totalPrice = selectedProduct.price * sellQty;
+
+      // 1. อัปเดตสต๊อกสินค้าในตาราง products
       const { error: updateError } = await supabase
         .from("products")
-        .update({ stock: updatedStock })
+        .update({ stock: newStock })
         .eq("id", selectedProduct.id);
 
       if (updateError) throw updateError;
 
-      // 4. แสดงข้อความสำเร็จและรีเซ็ตฟอร์ม
-      alert(`บันทึกการขายสำเร็จ! (รวมเป็นเงิน ${totalPrice.toLocaleString()} บาท)`);
+      // 2. บันทึกประวัติลงตาราง sales
+      const { error: salesError } = await supabase.from("sales").insert([
+        {
+          product_id: selectedProduct.id,
+          product_name: selectedProduct.name,
+          quantity: sellQty,
+          total_price: totalPrice,
+          sold_at: new Date().toISOString(),
+        },
+      ]);
+
+      if (salesError) throw salesError;
+
+      // --- ระบบส่งแจ้งเตือน Telegram ---
+      const nowFormatted = new Date().toLocaleString("th-TH", {
+        timeZone: "Asia/Bangkok",
+      });
+
+      // งานที่ 1: แจ้งเตือน Order เข้า (New Order Alert)
+      const orderMessage = `🛍️ <b>มีรายการขายใหม่!</b>
+- สินค้า: ${selectedProduct.name}
+- จำนวน: ${sellQty} ชิ้น
+- ราคารวม: ${totalPrice.toLocaleString()} บาท
+- สต๊อกคงเหลือปัจจุบัน: ${newStock} ชิ้น
+- เวลา: ${nowFormatted}`;
+
+      await sendTelegramNotification(orderMessage);
+
+      // งานที่ 2: แจ้งเตือน Stock เหลือน้อย (Low Stock Alert <= 5)
+      if (newStock <= 5) {
+        const lowStockMessage = `🚨 <b>[เตือนภัย] สต๊อกสินค้าใกล้หมด!</b>
+- สินค้า: ${selectedProduct.name}
+- คงเหลือเพียง: ${newStock} ชิ้น
+⚠️ กรุณาเติมสต๊อกสินค้าด่วน!`;
+
+        await sendTelegramNotification(lowStockMessage);
+      }
+
+      alert("บันทึกการขายเรียบร้อยแล้ว!");
       setQuantity(1);
-      
-      // ดึงข้อมูลสินค้าใหม่เพื่ออัปเดตสต็อกล่าสุดในหน้าเว็บ
-      await fetchProducts();
+      fetchProducts(); // โหลดสต๊อกล่าสุดใหม่
     } catch (error) {
       alert("เกิดข้อผิดพลาดในการขาย: " + error.message);
     } finally {
-      setSubmitting(false);
+      setLoading(false);
     }
   };
 
   return (
-    <div style={{ maxWidth: "600px", margin: "0 auto" }}>
-      <h2 style={{ marginBottom: "1.5rem" }}>🛒 หน้าขายสินค้า</h2>
+    <div className="max-w-xl mx-auto p-6 bg-white rounded-lg shadow-md mt-8">
+      <h1 className="text-2xl font-bold mb-6 text-gray-800">🛒 หน้าร้านขายสินค้า</h1>
 
-      <form
-        onSubmit={handleSell}
-        style={{
-          background: "#ffffff",
-          padding: "1.5rem",
-          borderRadius: "8px",
-          border: "1px solid #e4ded0",
-          boxShadow: "0 2px 4px rgba(0,0,0,0.05)",
-        }}
-      >
-        {loading ? (
-          <p style={{ textAlign: "center", color: "#7a7a72" }}>กำลังโหลดรายการสินค้า...</p>
-        ) : products.length === 0 ? (
-          <p style={{ textAlign: "center", color: "#7a7a72" }}>
-            ไม่พบรายการสินค้า กรุณาเพิ่มสินค้าที่หน้าแรกก่อน
-          </p>
-        ) : (
-          <>
-            {/* เลือกสินค้า */}
-            <div style={{ marginBottom: "1.25rem" }}>
-              <label style={labelStyle}>เลือกสินค้า:</label>
-              <select
-                value={selectedProductId}
-                onChange={(e) => setSelectedProductId(e.target.value)}
-                style={inputStyle}
-              >
-                {products.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name} — {p.price} บาท (คงเหลือ: {p.stock} {p.unit || "ชิ้น"})
-                  </option>
-                ))}
-              </select>
-            </div>
+      <form onSubmit={handleSell} className="space-y-4">
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            เลือกสินค้า:
+          </label>
+          <select
+            value={selectedProductId}
+            onChange={(e) => setSelectedProductId(e.target.value)}
+            className="w-full p-2 border rounded-md"
+          >
+            {products.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name} — {item.price} บาท (คงเหลือ: {item.stock} ชิ้น)
+              </option>
+            ))}
+          </select>
+        </div>
 
-            {/* จำนวนที่ต้องการขาย */}
-            <div style={{ marginBottom: "1.25rem" }}>
-              <label style={labelStyle}>จำนวนที่ขาย:</label>
-              <input
-                type="number"
-                min="1"
-                value={quantity}
-                onChange={(e) => setQuantity(e.target.value)}
-                style={inputStyle}
-                required
-              />
-            </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            จำนวนที่ขาย:
+          </label>
+          <input
+            type="number"
+            min="1"
+            max={selectedProduct ? selectedProduct.stock : 1}
+            value={quantity}
+            onChange={(e) => setQuantity(e.target.value)}
+            className="w-full p-2 border rounded-md"
+          />
+        </div>
 
-            {/* รายละเอียดสรุปราคารวม */}
-            {selectedProduct && (
-              <div
-                style={{
-                  background: "#f7f3ea",
-                  padding: "1rem",
-                  borderRadius: "6px",
-                  marginBottom: "1.5rem",
-                  border: "1px solid #e4ded0",
-                }}
-              >
-                <div style={{ display: "flex", justifyBetween: "space-between", marginBottom: "0.5rem" }}>
-                  <span>ราคาต่อหน่วย:</span>
-                  <strong>{selectedProduct.price.toLocaleString()} บาท</strong>
-                </div>
-                <div style={{ display: "flex", justifyBetween: "space-between", marginBottom: "0.5rem" }}>
-                  <span>จำนวนคงเหลือ:</span>
-                  <span style={{ color: selectedProduct.stock < 5 ? "#c96a4e" : "#2b2b28" }}>
-                    {selectedProduct.stock} {selectedProduct.unit || "ชิ้น"}
-                  </span>
-                </div>
-                <hr style={{ border: "none", borderTop: "1px solid #e4ded0", margin: "0.5rem 0" }} />
-                <div style={{ display: "flex", justifyBetween: "space-between", fontSize: "1.2rem", color: "#c96a4e" }}>
-                  <strong>ราคารวมทั้งหมด:</strong>
-                  <strong>{totalPrice.toLocaleString()} บาท</strong>
-                </div>
-              </div>
-            )}
-
-            {/* ปุ่มกดยืนยันการขาย */}
-            <button
-              type="submit"
-              disabled={submitting || !selectedProduct || selectedProduct.stock <= 0}
-              style={{
-                ...btnPrimaryStyle,
-                opacity: submitting || !selectedProduct || selectedProduct.stock <= 0 ? 0.6 : 1,
-                cursor: submitting || !selectedProduct || selectedProduct.stock <= 0 ? "not-allowed" : "pointer",
-              }}
-            >
-              {submitting ? "กำลังบันทึก..." : "ยืนยันการขาย"}
-            </button>
-          </>
+        {selectedProduct && (
+          <div className="p-4 bg-gray-50 rounded-md space-y-1">
+            <p className="text-sm text-gray-600">
+              ราคาต่อหน่วย: <b>{selectedProduct.price}</b> บาท
+            </p>
+            <p className="text-sm text-gray-600">
+              จำนวนคงเหลือ: <b>{selectedProduct.stock}</b> ชิ้น
+            </p>
+            <p className="text-lg font-bold text-green-700 mt-2">
+              ราคารวมทั้งหมด: {(selectedProduct.price * (parseInt(quantity) || 0)).toLocaleString()} บาท
+            </p>
+          </div>
         )}
+
+        <button
+          type="submit"
+          disabled={loading || !selectedProduct || selectedProduct.stock <= 0}
+          className="w-full bg-green-700 hover:bg-green-800 text-white font-bold py-2 px-4 rounded-md disabled:bg-gray-400"
+        >
+          {loading ? "กำลังบันทึก..." : "ยืนยันการขาย"}
+        </button>
       </form>
     </div>
   );
 }
-
-// Inline Styles
-const labelStyle = {
-  display: "block",
-  marginBottom: "0.5rem",
-  fontWeight: "600",
-  fontSize: "0.95rem",
-};
-
-const inputStyle = {
-  width: "100%",
-  padding: "0.6rem 0.8rem",
-  borderRadius: "4px",
-  border: "1px solid #ccc",
-  fontSize: "1rem",
-  boxSizing: "border-box",
-};
-
-const btnPrimaryStyle = {
-  width: "100%",
-  background: "#2f5233",
-  color: "white",
-  border: "none",
-  padding: "0.75rem",
-  borderRadius: "6px",
-  fontSize: "1.05rem",
-  fontWeight: "600",
-};
